@@ -18,7 +18,6 @@ class HEBiomarkerDataset(Dataset):
         self.he_image = he_image
         self.biomarkers = biomarkers
         
-        # Check which morphology features actually exist in the dataframe
         available_features = []
         for feature in morphology_features:
             if feature in df.columns:
@@ -31,7 +30,6 @@ class HEBiomarkerDataset(Dataset):
             print(f"Using {len(available_features)} morphology features: {available_features}")
             self.morphology_features = available_features
             
-        # Create a scaler for morphology features
         self.scaler = StandardScaler()
         morphology_data = df[self.morphology_features].values
         self.scaler.fit(morphology_data)
@@ -44,7 +42,6 @@ class HEBiomarkerDataset(Dataset):
         x, y, area = int(row["X_centroid"]), int(row["Y_centroid"]), int(row["Area"])
         radius = int(np.sqrt(area / np.pi))
         
-        # Extract and normalize RGB patch
         x_min, x_max = max(0, x - radius), min(self.he_image.shape[1], x + radius)
         y_min, y_max = max(0, y - radius), min(self.he_image.shape[0], y + radius)
         
@@ -64,12 +61,10 @@ class HEBiomarkerDataset(Dataset):
         patch = patch.astype(np.float32) / 255.0
         patch = np.transpose(patch, (2, 0, 1))
         
-        # Extract and normalize morphology features
         morphology_values = [row[feature] for feature in self.morphology_features]
         morphology_values = np.array(morphology_values, dtype=np.float32).reshape(1, -1)
         morphology_values = self.scaler.transform(morphology_values).flatten()
         
-        # Get target biomarker values
         targets = np.zeros(len(self.biomarkers), dtype=np.float32)
         for i, biomarker in enumerate(self.biomarkers):
             targets[i] = np.log1p(row[biomarker])
@@ -80,7 +75,6 @@ class BiomarkerMLP(nn.Module):
     def __init__(self, num_biomarkers, num_morphology_features):
         super(BiomarkerMLP, self).__init__()
         
-        # Input is flattened RGB (3*16*16) + morphology features
         rgb_input_size = 3 * 16 * 16
         total_input_size = rgb_input_size + num_morphology_features
         
@@ -92,13 +86,10 @@ class BiomarkerMLP(nn.Module):
         )
         
     def forward(self, rgb_input, morphology_input):
-        # Flatten RGB input
         rgb_flat = rgb_input.view(rgb_input.size(0), -1)
         
-        # Concatenate RGB and morphology features
         combined_input = torch.cat((rgb_flat, morphology_input), dim=1)
         
-        # Pass through MLP
         x = self.fc(combined_input)
         return x
 
@@ -113,15 +104,11 @@ def train_evaluation_pipeline(data_directory, biomarkers, morphology_features, n
     val_folders = [folders[8]]
     test_folders = [folders[9]]
     
-    # Print info about the requested morphology features
     print(f"Requested morphology features: {morphology_features}")
-    print("Note: Only features present in the CSV files will be used.")
     
-    # First, determine which morphology features are available across all datasets
     common_features = set()
     first = True
     
-    # Check train folders
     for folder in train_folders + val_folders + test_folders:
         file_index = os.path.basename(folder)
         csv_file = None
@@ -144,13 +131,11 @@ def train_evaluation_pipeline(data_directory, biomarkers, morphology_features, n
         else:
             common_features = common_features.intersection(set(available))
     
-    # Ensure we have at least these basic features
     required_features = ["Area", "X_centroid", "Y_centroid"]
     for feature in required_features:
         if feature not in common_features:
             common_features.add(feature)
     
-    # Convert set back to list
     common_morphology_features = sorted(list(common_features))
     print(f"Common morphology features across all datasets: {common_morphology_features}")
     
@@ -238,7 +223,6 @@ def train_evaluation_pipeline(data_directory, biomarkers, morphology_features, n
         print("Missing required datasets")
         return
     
-    # Get the actual number of morphology features used
     num_morphology_features = len(common_morphology_features)
     print(f"Using {num_morphology_features} morphology features")
     
