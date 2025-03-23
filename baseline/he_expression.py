@@ -1,105 +1,140 @@
 import numpy as np
 import tifffile as tiff
 import time
-from sklearn.metrics import r2_score
+import zarr
 from scipy.stats import spearmanr, pearsonr
 from lifelines.utils import concordance_index
 import gc
 import os
+import psutil
+from joblib import Parallel, delayed
 
-def process_biomarker(i, biomarker_name, hefile_path, iffile_path, sample_size=500_000):
-    """Process a single biomarker following the paper's approach."""
+def get_memory_usage():
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 * 1024 * 1024)  # Convert to GB
+
+def convert_tiff_to_zarr(tiff_path, zarr_path):
+    """Convert a large TIFF file to Zarr format for faster random access."""
+    if not os.path.exists(zarr_path):
+        print(f"Converting {tiff_path} to {zarr_path} for faster access...")
+        img = tiff.imread(tiff_path)
+        zarr.save(zarr_path, img)
+        print(f"Conversion complete: {zarr_path}")
+    return zarr.load(zarr_path)
+
+def process_chunk_means(he_chunk, bio_chunk):
+    return np.sum(he_chunk), np.sum(bio_chunk), he_chunk.size
+
+def process_chunk_cov(he_chunk, bio_chunk, he_mean, bio_mean):
+    he_diff = he_chunk - he_mean
+    bio_diff = bio_chunk - bio_mean
+    return np.sum(he_diff * he_diff), np.sum(bio_diff * bio_diff), np.sum(he_diff * bio_diff), he_chunk.size
+
+def process_chunk_corr(he_chunk, bio_chunk):
+    if he_chunk.size > 1_000_000:
+        indices = np.random.choice(he_chunk.size, size=1_000_000, replace=False)
+        he_sample = he_chunk[indices]
+        bio_sample = bio_chunk[indices]
+    else:
+        he_sample = he_chunk
+        bio_sample = bio_chunk
+    pearson_r, _ = pearsonr(he_sample, bio_sample)
+    spearman_r, _ = spearmanr(he_sample, bio_sample)
+    c_index = concordance_index(he_sample, bio_sample)
+    return pearson_r, spearman_r, c_index, he_chunk.size
+
+def parallel_process_biomarker(i, biomarker_name, hefile_path, iffile_path, num_processes):
     start_time = time.time()
-    print(f"Processing {biomarker_name}...")
-    
-    print("  Loading H&E image...")
-    HE_image = tiff.imread(hefile_path)
-    
-    HE_mean = np.mean(HE_image, axis=2).astype(np.float32) / 255.0
-    HE_expression = 1.0 - HE_mean  
-    
-    HE_flat = HE_expression.ravel()
-    
-    del HE_image
-    del HE_expression
-    gc.collect()
+    print(f"Processing {biomarker_name} using {num_processes} processes...")
+    print(f"Memory before loading: {get_memory_usage():.2f} GB")
 
-    print(f"  Loading biomarker {i}...")
-    biomarker = tiff.imread(iffile_path, key=i)
-    biomarker_flat = biomarker.astype(np.float32).ravel() / 65535.0
-    
+    # --- Load H&E Image (Convert to Zarr for faster access) ---
+    HE_image = convert_tiff_to_zarr(hefile_path, "HE_image.zarr")
+    HE_mean = np.mean(HE_image, axis=2, dtype=np.float32) / 255.0
+    HE_expression = 1.0 - HE_mean
+    del HE_image, HE_mean
+    gc.collect()
+    print(f"Memory after H&E processing: {get_memory_usage():.2f} GB")
+
+    # --- Load Biomarker Image (Zarr conversion) ---
+    biomarker = convert_tiff_to_zarr(iffile_path, f"biomarker_{i}.zarr")
+    biomarker_float = biomarker.astype(np.float32) / 65535.0
     del biomarker
     gc.collect()
-    
-    if len(HE_flat) > sample_size:
-        np.random.seed(42)
-        indices = np.random.choice(len(HE_flat), size=sample_size, replace=False)
-        HE_sample = HE_flat[indices]
-        biomarker_sample = biomarker_flat[indices]
-    else:
-        HE_sample = HE_flat
-        biomarker_sample = biomarker_flat
-    
-    del HE_flat
-    del biomarker_flat
+    print(f"Memory after biomarker loading: {get_memory_usage():.2f} GB")
+
+    # --- Ensure Shape Consistency ---
+    if HE_expression.shape != biomarker_float.shape:
+        min_rows, min_cols = min(HE_expression.shape[0], biomarker_float.shape[0]), min(HE_expression.shape[1], biomarker_float.shape[1])
+        HE_expression, biomarker_float = HE_expression[:min_rows, :min_cols], biomarker_float[:min_rows, :min_cols]
+
+    total_pixels = HE_expression.size
+    print(f"Total pixels to process: {total_pixels:,}")
+
+    # --- Flatten the Arrays ---
+    HE_flat, biomarker_flat = HE_expression.ravel(), biomarker_float.ravel()
+    del HE_expression, biomarker_float
     gc.collect()
-    
-    pearson_r, _ = pearsonr(HE_sample, biomarker_sample)
-    spearman_r, _ = spearmanr(HE_sample, biomarker_sample)
-    c_index = concordance_index(HE_sample, biomarker_sample)
-    
+    print(f"Memory after flattening: {get_memory_usage():.2f} GB")
+
+    # --- Set Chunk Size (50M Pixels for Efficient Parallelization) ---
+    chunk_size = 50_000_000
+    num_chunks = (total_pixels + chunk_size - 1) // chunk_size
+    print(f"Using {num_chunks} chunks with ~{chunk_size:,} pixels per chunk")
+
+    # --- Compute Means in Parallel ---
+    chunk_means_results = Parallel(n_jobs=num_processes)(
+        delayed(process_chunk_means)(
+            HE_flat[j * chunk_size: min((j + 1) * chunk_size, total_pixels)],
+            biomarker_flat[j * chunk_size: min((j + 1) * chunk_size, total_pixels)]
+        ) for j in range(num_chunks)
+    )
+    total_he_sum, total_bio_sum, total_count = map(sum, zip(*chunk_means_results))
+    he_mean_val, bio_mean_val = total_he_sum / total_count, total_bio_sum / total_count
+
+    # --- Compute Covariance in Parallel ---
+    chunk_cov_results = Parallel(n_jobs=num_processes)(
+        delayed(process_chunk_cov)(
+            HE_flat[j * chunk_size: min((j + 1) * chunk_size, total_pixels)],
+            biomarker_flat[j * chunk_size: min((j + 1) * chunk_size, total_pixels)],
+            he_mean_val, bio_mean_val
+        ) for j in range(num_chunks)
+    )
+    total_he_var_sum, total_bio_var_sum, total_cov_sum, total_count_cov = map(sum, zip(*chunk_cov_results))
+    he_std, bio_std = np.sqrt(total_he_var_sum / total_count_cov), np.sqrt(total_bio_var_sum / total_count_cov)
+    covariance, pearson_r = total_cov_sum / total_count_cov, covariance / (he_std * bio_std)
+
+    # --- Compute Correlations (Sampling for Speed) ---
+    if total_pixels > 1_000_000_000:
+        num_corr_chunks = min(num_processes, total_pixels // 1_000_000)
+        np.random.seed(42)
+        corr_results = Parallel(n_jobs=num_processes)(
+            delayed(process_chunk_corr)(
+                np.random.choice(HE_flat, size=1_000_000, replace=False),
+                np.random.choice(biomarker_flat, size=1_000_000, replace=False)
+            ) for _ in range(num_corr_chunks)
+        )
+        total_count_corr = sum(res[3] for res in corr_results)
+        avg_spearman = sum(res[1] * res[3] for res in corr_results) / total_count_corr
+        avg_c_index = sum(res[2] * res[3] for res in corr_results) / total_count_corr
+    else:
+        avg_spearman, _ = spearmanr(HE_flat, biomarker_flat)
+        avg_c_index = concordance_index(HE_flat, biomarker_flat)
+
+    del HE_flat, biomarker_flat
+    gc.collect()
     processing_time = time.time() - start_time
-    print(f"  Completed {biomarker_name} in {processing_time:.2f} seconds")
-    print(f"  Results: Pearson={pearson_r:.3f}, Spearman={spearman_r:.3f}, C-index={c_index:.3f}")
-    
-    return {
-        "biomarker": biomarker_name,
-        "Pearson R": pearson_r,
-        "Spearman R": spearman_r,
-        "C-index": c_index,
-        "processing_time": processing_time
-    }
+    print(f"Completed {biomarker_name} in {processing_time:.2f} seconds")
+    return {"biomarker": biomarker_name, "Pearson R": pearson_r, "Spearman R": avg_spearman, "C-index": avg_c_index, "processing_time": processing_time}
 
 def main():
-    start_total = time.time()
-    
-    hefile_path = "../data/data/CRC01/18459_LSP10353_US_SCAN_OR_001__093059-registered.ome.tif"
-    iffile_path = "../data/data/CRC01/P37_S29_A24_C59kX_E15_20220106_014304_946511-zlib.ome.tiff"
-    
-    biomarker_names = [
-        "Hoechst (Nucleus Staining)", "AF1", "CD31 (Endothelial Cells)", "CD45 (Immune Cells)", 
-        "CD68 (Macrophages)", "Argo550", "CD4 (Helper T Cells)", "FOXP3 (Regulatory T Cells)",
-        "CD8a (Cytotoxic T Cells)", "CD45RO (Memory T Cells)", "CD20 (B Cells)", "PD-L1 (Immune Checkpoint)",
-        "CD3e (General T Cells)", "CD163 (M2 Macrophages)", "E-cadherin (Epithelial Cells)", 
-        "PD-1 (Immune Checkpoint)", "Ki67 (Proliferation Marker)", "Pan-CK (Tumor Cells)", "SMA (Fibroblasts)"
-    ]
-
-    results = {}
-    
-    for i, biomarker_name in enumerate(biomarker_names):
-        result = process_biomarker(i, biomarker_name, hefile_path, iffile_path)
-        results[biomarker_name] = result
-    
-    print("\nFinal Results Summary:")
-    print("=" * 80)
-    print(f"{'Biomarker':<30} {'Pearson R':>10} {'Spearman R':>12} {'C-index':>10}")
-    print("-" * 80)
-    
-    for biomarker_name in biomarker_names:
-        scores = results[biomarker_name]
-        print(f"{biomarker_name:<30} {scores['Pearson R']:>10.3f} {scores['Spearman R']:>12.3f} "
-              f"{scores['C-index']:>10.3f}")
-    
-    avg_pearson = np.mean([scores['Pearson R'] for scores in results.values()])
-    avg_spearman = np.mean([scores['Spearman R'] for scores in results.values()])
-    avg_cindex = np.mean([scores['C-index'] for scores in results.values()])
-    
-    print("\nAverage metrics across all biomarkers:")
-    print(f"Average Pearson R: {avg_pearson:.3f}")
-    print(f"Average Spearman R: {avg_spearman:.3f}")
-    print(f"Average C-index: {avg_cindex:.3f}")
-    
-    print(f"\nTotal execution time: {time.time() - start_total:.2f} seconds")
+    hefile_path, iffile_path = "HE_image.tif", "IF_image.tif"
+    biomarker_names = ["Hoechst", "AF1", "CD31", "CD45", "CD68"]
+    num_cpus = os.cpu_count()
+    optimal_processes = min(64, num_cpus // 2)
+    print(f"Using {optimal_processes} parallel processes")
+    results = {b: parallel_process_biomarker(i, b, hefile_path, iffile_path, optimal_processes) for i, b in enumerate(biomarker_names)}
+    print("\nFinal Results:", results)
 
 if __name__ == "__main__":
     main()
