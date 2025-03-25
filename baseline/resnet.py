@@ -12,8 +12,8 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 import random
 import torchvision.transforms as transforms
-from torchvision.models import vit_b_16, ViT_B_16_Weights
-from torch.cuda.amp import GradScaler
+from torchvision.models import resnet50, ResNet50_Weights
+from torch.cuda.amp import autocast, GradScaler
 
 class HEBiomarkerDataset(Dataset):
     def __init__(self, df, he_image, biomarkers, transform=None):
@@ -65,7 +65,7 @@ class HEBiomarkerDataset(Dataset):
         return patch, torch.tensor(targets, dtype=torch.float32)
 
 class CachedHEBiomarkerDataset(HEBiomarkerDataset):
-    def __init__(self, df, he_image, biomarkers, transform=None, cache_size=5000):
+    def __init__(self, df, he_image, biomarkers, transform=None, cache_size=1000):
         super().__init__(df, he_image, biomarkers, transform)
         self.cache = {}
         self.cache_size = cache_size
@@ -81,25 +81,31 @@ class CachedHEBiomarkerDataset(HEBiomarkerDataset):
             
         return item
 
-class BiomarkerModelViT(nn.Module):
+from torchvision.models import resnet50, ResNet50_Weights
+
+class BiomarkerModel(nn.Module):
     def __init__(self, num_biomarkers, pretrained=True):
-        super(BiomarkerModelViT, self).__init__()
+        super(BiomarkerModel, self).__init__()
         
         if pretrained:
-            self.backbone = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+            self.backbone = resnet50(weights=ResNet50_Weights.IMAGENET1K_V1)
         else:
-            self.backbone = vit_b_16()
+            self.backbone = resnet50()
         
-        hidden_dim = self.backbone.heads.head.in_features
-        self.backbone.heads.head = nn.Identity()
+        backbone_output_size = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
         
-        self.regression_head = nn.Linear(hidden_dim, num_biomarkers)
+        self.regression_head = nn.Sequential(
+            nn.Linear(backbone_output_size, 512),
+            nn.ReLU(),
+            nn.Linear(512, num_biomarkers)
+        )
         
     def forward(self, x):
         features = self.backbone(x)
         return self.regression_head(features)
 
-def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, num_epochs=5):
+def train_regression_only_pipeline(data_directory, biomarkers, batch_size=128, num_epochs=5):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available. This code requires GPU.")
     
@@ -153,7 +159,7 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
         df = pd.read_csv(csv_file)
         he_image = tifffile.imread(he_path)
         
-        dataset = CachedHEBiomarkerDataset(df, he_image, biomarkers, transform=transform, cache_size=5000)
+        dataset = CachedHEBiomarkerDataset(df, he_image, biomarkers, transform=transform, cache_size=2000)
         train_datasets.append(dataset)
     
     for folder in val_folders:
@@ -207,9 +213,9 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
         print("Missing required datasets")
         return
     
-    num_workers = 8
+    num_workers = 4
     pin_memory = True
-    prefetch_factor = 4
+    prefetch_factor = 2
     persistent_workers = True
     
     train_loader = DataLoader(
@@ -240,7 +246,7 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
         persistent_workers=persistent_workers
     )
     
-    model = BiomarkerModelViT(len(biomarkers), pretrained=True)
+    model = BiomarkerModel(len(biomarkers), pretrained=True)
     model = model.cuda()
     
     if torch.cuda.device_count() > 1:
@@ -255,12 +261,13 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
             param.requires_grad = True
     
     criterion = nn.MSELoss()
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=1e-2, weight_decay=0.01)
+    
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=5e-3, eps=1e-8)
     
     steps_per_epoch = len(train_loader)
     scheduler = optim.lr_scheduler.OneCycleLR(
         optimizer,
-        max_lr=1e-2,
+        max_lr=5e-3,
         steps_per_epoch=steps_per_epoch,
         epochs=num_epochs,
         pct_start=0.3,
@@ -272,7 +279,8 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
     os.makedirs(output_dir, exist_ok=True)
     
     best_val_loss = float('inf')
-    accumulation_steps = 4
+    
+    accumulation_steps = 1
     
     print(f"Training regression head for {num_epochs} epochs...")
     for epoch in range(num_epochs):
@@ -284,7 +292,7 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
         for i, (inputs, targets) in enumerate(tqdm(train_loader, desc=f"Training Epoch {epoch+1}/{num_epochs}")):
             inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             
-            with torch.amp.autocast('cuda'):
+            with autocast():
                 outputs = model(inputs)
                 loss = criterion(outputs, targets) / accumulation_steps
             
@@ -298,24 +306,11 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
             
             train_loss += loss.item() * accumulation_steps * inputs.size(0)
             
-            if i > 0 and i % 2000 == 0:
+
+            if i > 0 and i % 800 == 0:
                 torch.cuda.empty_cache()
         
         train_loss /= len(train_loader.dataset)
-        
-        if epoch >= 2:
-            for param in model.parameters():
-                param.requires_grad = True
-            optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=0.01)
-            scheduler = optim.lr_scheduler.OneCycleLR(
-                optimizer,
-                max_lr=5e-4,
-                steps_per_epoch=steps_per_epoch,
-                epochs=num_epochs-epoch,
-                pct_start=0.3,
-                div_factor=10,
-                final_div_factor=100
-            )
         
         model.eval()
         val_loss = 0.0
@@ -324,7 +319,7 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
             for inputs, targets in tqdm(val_loader, desc=f"Validating Epoch {epoch+1}/{num_epochs}"):
                 inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
                 
-                with torch.amp.autocast('cuda'):
+                with autocast():
                     outputs = model(inputs)
                     loss = criterion(outputs, targets)
                 
@@ -365,7 +360,7 @@ def train_regression_only_pipeline(data_directory, biomarkers, batch_size=512, n
         for inputs, targets in tqdm(test_loader, desc="Testing"):
             inputs, targets = inputs.to(device, non_blocking=True), targets.to(device, non_blocking=True)
             
-            with torch.amp.autocast('cuda'):
+            with autocast():
                 outputs = model(inputs)
                 loss = criterion(outputs, targets)
                 
@@ -434,10 +429,13 @@ if __name__ == "__main__":
         "CD45RO", "CD20", "PD-L1", "CD3e", "CD163", "E-cadherin", "PD-1", "Ki67", "Pan-CK", "SMA"
     ]
     
-    batch_size = 512
+    batch_size = 128
+    
+    print(f"Selected batch size: {batch_size}")
+    
     torch.cuda.empty_cache()
     
     if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
         torch.cuda.set_per_process_memory_fraction(0.9)
     
-    train_regression_only_pipeline(data_directory, biomarkers, batch_size=batch_size, num_epochs=1)
+    train_regression_only_pipeline(data_directory, biomarkers, batch_size=batch_size, num_epochs=5)
