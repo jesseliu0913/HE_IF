@@ -172,4 +172,6 @@ cython_debug/
 
 /data/data/*
 /baseline/results/*
-
+/baseline/wandb/*
+/melatlas/*
+/other_data/*
