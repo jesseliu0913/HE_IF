@@ -178,3 +178,4 @@ cython_debug/
 /graph_comparison/cell_feature/*
 /graph_comparison/cell_feature/cell_features.npz
 /graph_comparison/cell_feature/data_splits.json
+/baseline/temp_cell_coords.csv
