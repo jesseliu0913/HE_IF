@@ -11,6 +11,7 @@ from torchvision import transforms
 from transformers import ViTModel, ViTImageProcessor
 from sklearn.model_selection import train_test_split
 
+
 def extract_patch(he_image, x, y, area, size=224):
     image = np.transpose(he_image, (1, 2, 0)) 
     radius = int(np.sqrt(area / np.pi))

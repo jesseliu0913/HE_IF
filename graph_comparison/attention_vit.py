@@ -35,14 +35,11 @@ def load_cell_features(data_path="/playpen/jesse/HE_IF/graph_comparison/cell_fea
     
     return cell_ids, features, coords, data_splits
 
-def create_kmeans_graph(cell_features, cell_coords, n_clusters=None, k_neighbors=10, max_distance=50, 
+def create_attention_graph(cell_features, cell_coords, n_clusters=None, k_neighbors=10, max_distance=50, 
                         batch_size=5000, memory_efficient=True, cache_path=None, cache_id=None):
-    """
-    Create K-means based graph with caching capability
-    """
-    # If cache path and ID are provided, try to load from cache
+    
     if cache_path and cache_id:
-        cache_file = f"{cache_path}/kmeans_graph_cache_{cache_id}.pkl"
+        cache_file = f"{cache_path}/attention_graph_cache_{cache_id}.pkl"
         if os.path.exists(cache_file):
             print(f"Loading cached graph from {cache_file}...")
             with open(cache_file, "rb") as f:
@@ -51,116 +48,64 @@ def create_kmeans_graph(cell_features, cell_coords, n_clusters=None, k_neighbors
                 data = cached_data["data"]
                 return G, data
     
-    print(f"Creating K-means graph for {len(cell_coords)} cells...")
+    print(f"Creating attention-based graph for {len(cell_coords)} cells...")
     
-    # Determine number of clusters if not specified
-    if n_clusters is None:
-        # A rule of thumb: sqrt of number of samples
-        n_clusters = min(int(np.sqrt(len(cell_coords))), 100)
-    
-    print(f"Clustering into {n_clusters} clusters...")
-    
-    # Perform K-means clustering
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(cell_coords)
-    
-    # Create a graph
     G = nx.Graph()
     
-    # Add nodes to the graph
     for i in tqdm(range(len(cell_coords)), desc="Adding nodes"):
-        G.add_node(i, pos=cell_coords[i], cluster=cluster_labels[i])
+        G.add_node(i, pos=cell_coords[i])
     
-    # Connect nodes within the same cluster based on nearest neighbors
-    print("Connecting nodes within clusters...")
+    num_cells = len(cell_coords)
     
-    # Process each cluster separately to save memory
-    for cluster_id in tqdm(range(n_clusters), desc="Processing clusters"):
-        # Get indices of cells in this cluster
-        cluster_indices = np.where(cluster_labels == cluster_id)[0]
+    print("Computing attention scores and connecting nodes...")
+    
+    for i in tqdm(range(0, num_cells, batch_size), desc="Processing batches"):
+        batch_end = min(i + batch_size, num_cells)
+        batch_indices = list(range(i, batch_end))
+        batch_features = cell_features[batch_indices]
+        batch_coords = cell_coords[batch_indices]
         
-        if len(cluster_indices) > 1:  # Need at least 2 points for nearest neighbors
-            # Get coordinates of cells in this cluster
-            cluster_coords = cell_coords[cluster_indices]
+        nn = NearestNeighbors(n_neighbors=k_neighbors+1)  
+        nn.fit(cell_coords)  
+        distances, indices = nn.kneighbors(batch_coords)
+        
+        for j, idx in enumerate(batch_indices):
+            source = idx
+            source_features = batch_features[j]
             
-            # Find k nearest neighbors for each cell in the cluster
-            k = min(k_neighbors, len(cluster_indices) - 1)  # Can't have more neighbors than points - 1
-            nn = NearestNeighbors(n_neighbors=k+1)  # +1 because the point itself is included
-            nn.fit(cluster_coords)
-            distances, indices = nn.kneighbors(cluster_coords)
-            
-            # Add edges based on nearest neighbors
-            for i in range(len(cluster_indices)):
-                source = cluster_indices[i]
+            for k, neighbor_idx in enumerate(indices[j][1:], 1):
+                target = neighbor_idx
+                dist = distances[j][k]
                 
-                # Skip the first neighbor as it's the point itself
-                for j, idx in enumerate(indices[i][1:], 1):
-                    target = cluster_indices[idx]
-                    dist = distances[i][j]
+                if max_distance is None or dist <= max_distance:
+                    target_features = cell_features[target]
                     
-                    # Only add edge if within max_distance
-                    if max_distance is None or dist <= max_distance:
-                        G.add_edge(int(source), int(target))
-    
-    # Connect neighboring clusters
-    print("Connecting neighboring clusters...")
-    
-    # Find centroids of each cluster
-    centroids = kmeans.cluster_centers_
-    
-    # Find nearest neighboring clusters for each cluster
-    nn_clusters = NearestNeighbors(n_neighbors=3)  # Connect to 2 nearest clusters
-    nn_clusters.fit(centroids)
-    c_distances, c_indices = nn_clusters.kneighbors(centroids)
-    
-    # For each pair of neighboring clusters, connect their boundary points
-    for i in range(n_clusters):
-        cluster_i_indices = np.where(cluster_labels == i)[0]
-        
-        # Skip the first neighbor as it's the cluster itself
-        for j in c_indices[i][1:]:
-            cluster_j_indices = np.where(cluster_labels == j)[0]
-            
-            # Find the closest pair of points between the two clusters
-            min_dist = float('inf')
-            closest_pair = None
-            
-            # Use a sampling approach to reduce computational load for large clusters
-            sample_size_i = min(len(cluster_i_indices), 100)
-            sample_size_j = min(len(cluster_j_indices), 100)
-            
-            sampled_i = np.random.choice(cluster_i_indices, sample_size_i, replace=False)
-            sampled_j = np.random.choice(cluster_j_indices, sample_size_j, replace=False)
-            
-            for idx_i in sampled_i:
-                for idx_j in sampled_j:
-                    dist = np.linalg.norm(cell_coords[idx_i] - cell_coords[idx_j])
-                    if dist < min_dist and dist <= max_distance:
-                        min_dist = dist
-                        closest_pair = (idx_i, idx_j)
-            
-            # Connect the closest pair if found and within max_distance
-            if closest_pair is not None:
-                G.add_edge(int(closest_pair[0]), int(closest_pair[1]))
+                    source_norm = source_features / (np.linalg.norm(source_features) + 1e-8)
+                    target_norm = target_features / (np.linalg.norm(target_features) + 1e-8)
+                    
+                    attention_score = np.dot(source_norm, target_norm)
+
+                    if attention_score > 0: # cannot be 0 (0.2 / 0.3)
+                        G.add_edge(int(source), int(target), weight=float(attention_score))
     
     print(f"Graph construction complete: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
-    # Create edge_index for PyTorch Geometric
     edge_list = list(G.edges())
     edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
     
-    # Create feature tensor
+    edge_weights = [G[u][v].get('weight', 1.0) for u, v in G.edges()]
+    edge_attr = torch.tensor(edge_weights, dtype=torch.float).view(-1, 1)
+    
     if memory_efficient:
         x = torch.tensor(cell_features, dtype=torch.float32)
     else:
         x = torch.tensor(np.array([cell_features[i] for i in G.nodes()]), dtype=torch.float32)
     
-    data = Data(x=x, edge_index=edge_index)
+    data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
     
-    # Save to cache if cache path and ID are provided
     if cache_path and cache_id:
         os.makedirs(cache_path, exist_ok=True)
-        cache_file = f"{cache_path}/kmeans_graph_cache_{cache_id}.pkl"
+        cache_file = f"{cache_path}/attention_graph_cache_{cache_id}.pkl"
         print(f"Saving graph to cache: {cache_file}")
         with open(cache_file, "wb") as f:
             pickle.dump({"G": G, "data": data}, f)
@@ -267,17 +212,13 @@ def train_model(model, train_data, val_data, train_targets, val_targets, num_epo
     val_targets = val_targets.to(device)
     model = model.to(device)
     
-    # Create subgraph batches manually
     def create_subgraph_batch(data, indices):
-        # Extract a subgraph containing only the nodes in indices
         node_mask = torch.zeros(data.x.size(0), dtype=torch.bool)
         node_mask[indices] = True
         
-        # Get edges where both nodes are in our batch
         edge_mask = node_mask[data.edge_index[0]] & node_mask[data.edge_index[1]]
         batch_edge_index = data.edge_index[:, edge_mask]
         
-        # Remap node indices to be consecutive
         node_idx = torch.zeros(data.x.size(0), dtype=torch.long)
         node_idx[indices] = torch.arange(len(indices))
         batch_edge_index = node_idx[batch_edge_index]
@@ -445,7 +386,7 @@ def evaluate_model(model, test_data, biomarkers, test_targets, output_dir="resul
     return results, targets, outputs
 
 def main():
-    data_path = "/playpen/jesse/HE_IF/graph_comparison/cell_feature"
+    data_path = "./cell_feature"
     cell_ids, features, coords, data_splits = load_cell_features(data_path)
     
     csv_file = "/playpen/jesse/HE_IF/graph_comparison/cell_feature/CRC03_new_coordinates.csv"
@@ -461,9 +402,15 @@ def main():
         'CD8a', 'PDL1', 'CDX2', 'CD31', 'Collagen'
     ]
     
+    # Get indices from data_splits
     train_indices = data_splits['train']
     val_indices = data_splits['val']
     test_indices = data_splits['test']
+    
+    # Convert string indices to integers if needed
+    train_indices = [int(idx) for idx in train_indices]
+    val_indices = [int(idx) for idx in val_indices]
+    test_indices = [int(idx) for idx in test_indices]
     
     biomarker_data = np.log1p(df[biomarker_cols].values)
     
@@ -473,6 +420,7 @@ def main():
 
     print(f"Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)} cells")
     
+    # Normalize features
     scaler = StandardScaler()
     train_features = scaler.fit_transform(features[train_indices])
     val_features = scaler.transform(features[val_indices])
@@ -483,11 +431,11 @@ def main():
     test_coords = coords[test_indices]
 
     # Setup cache directory
-    cache_dir = "/playpen/jesse/HE_IF/graph_comparison/graph_cache"
+    cache_dir = "./graph_cache"
     os.makedirs(cache_dir, exist_ok=True)
     
     # Use the K-means graph construction with caching
-    G_train, train_data = create_kmeans_graph(
+    G_train, train_data = create_attention_graph(
         train_features, 
         train_coords, 
         n_clusters=int(np.sqrt(len(train_coords))),
@@ -495,9 +443,9 @@ def main():
         max_distance=50, 
         memory_efficient=True,
         cache_path=cache_dir,
-        cache_id="kmeans_train"
+        cache_id="train_naive"
     )
-    G_val, val_data = create_kmeans_graph(
+    G_val, val_data = create_attention_graph(
         val_features, 
         val_coords, 
         n_clusters=int(np.sqrt(len(val_coords))),
@@ -505,9 +453,9 @@ def main():
         max_distance=50, 
         memory_efficient=True,
         cache_path=cache_dir,
-        cache_id="kmeans_val"
+        cache_id="val_naive"
     )
-    G_test, test_data = create_kmeans_graph(
+    G_test, test_data = create_attention_graph(
         test_features, 
         test_coords, 
         n_clusters=int(np.sqrt(len(test_coords))),
@@ -515,10 +463,10 @@ def main():
         max_distance=50, 
         memory_efficient=True,
         cache_path=cache_dir,
-        cache_id="kmeans_test"
+        cache_id="test_naive"
     )
 
-    input_dim = features.shape[1]
+    input_dim = features.shape[1]  # This will now be height * width from the resized patch
     output_dim = len(biomarker_cols)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -540,7 +488,7 @@ def main():
     
     print("Starting training...")
 
-    output_dir = "hybrid_kmeans_gnn_results"
+    output_dir = "vit_attnetion_gnn_results"
     epochs = 50
     patience = 15
     lr = 0.001
@@ -573,39 +521,5 @@ def main():
 if __name__ == "__main__":
     main()
 
-# CUDA_VISIBLE_DEVICES=4 nohup python k_means_vit.py > ./log/k_means_vit.log 2>&1 &
-
-"""
-A488: Pearson=0.0020, Spearman=0.0034, C-index=0.5012
-CD3: Pearson=-0.0012, Spearman=0.0065, C-index=0.5022
-Ki67: Pearson=-0.0006, Spearman=0.0022, C-index=0.5007
-CD4: Pearson=0.0020, Spearman=0.0114, C-index=0.5038
-CD20: Pearson=0.0033, Spearman=0.0097, C-index=0.5032
-CD163: Pearson=0.0073, Spearman=0.0043, C-index=0.5014
-Ecadherin: Pearson=-0.0009, Spearman=0.0058, C-index=0.5019
-LaminABC: Pearson=0.0007, Spearman=0.0036, C-index=0.5012
-PCNA: Pearson=0.0026, Spearman=0.0066, C-index=0.5022
-A555: Pearson=0.0034, Spearman=0.0043, C-index=0.5015
-NaKATPase: Pearson=-0.0025, Spearman=0.0018, C-index=0.5006
-Keratin: Pearson=-0.0016, Spearman=0.0036, C-index=0.5012
-CD45: Pearson=0.0013, Spearman=-0.0041, C-index=0.4986
-CD68: Pearson=0.0012, Spearman=0.0059, C-index=0.5020
-FOXP3: Pearson=0.0031, Spearman=0.0007, C-index=0.5002
-Vimentin: Pearson=0.0029, Spearman=-0.0023, C-index=0.4992
-Desmin: Pearson=0.0096, Spearman=0.0054, C-index=0.5018
-Ki67_570: Pearson=0.0022, Spearman=0.0058, C-index=0.5020
-A647: Pearson=0.0031, Spearman=0.0041, C-index=0.5014
-CD45RO: Pearson=-0.0037, Spearman=0.0057, C-index=0.5019
-aSMA: Pearson=0.0065, Spearman=0.0046, C-index=0.5015
-PD1: Pearson=0.0058, Spearman=0.0107, C-index=0.5036
-CD8a: Pearson=0.0041, Spearman=0.0029, C-index=0.5010
-PDL1: Pearson=-0.0007, Spearman=0.0017, C-index=0.5006
-CDX2: Pearson=0.0033, Spearman=0.0099, C-index=0.5033
-CD31: Pearson=0.0111, Spearman=0.0053, C-index=0.5018
-Collagen: Pearson=0.0039, Spearman=0.0016, C-index=0.5005
-
-AVERAGE METRICS:
-Average Pearson R: 0.0036
-Average Spearman R: 0.0048
-Average C-index: 0.5015
-"""
+# CUDA_VISIBLE_DEVICES=5 nohup python attention_vit.py > attention_vit.log 2>&1 &
+# CUDA_VISIBLE_DEVICES=5 python attention_vit.py 

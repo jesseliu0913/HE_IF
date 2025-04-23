@@ -7,13 +7,13 @@ from torch_geometric.data import Data
 from scipy.stats import pearsonr, spearmanr
 from lifelines.utils import concordance_index
 from sklearn.preprocessing import StandardScaler
-from sklearn.cluster import KMeans
 from sklearn.neighbors import NearestNeighbors
 import os
 import numpy as np
 import pandas as pd
 import networkx as nx
 from tqdm.auto import tqdm
+from scipy.spatial import Voronoi, voronoi_plot_2d
 import warnings
 import pickle
 warnings.filterwarnings('ignore')
@@ -35,14 +35,14 @@ def load_cell_features(data_path="/playpen/jesse/HE_IF/graph_comparison/cell_fea
     
     return cell_ids, features, coords, data_splits
 
-def create_kmeans_graph(cell_features, cell_coords, n_clusters=None, k_neighbors=10, max_distance=50, 
-                        batch_size=5000, memory_efficient=True, cache_path=None, cache_id=None):
+def create_voronoi_graph(cell_features, cell_coords, max_distance=50, memory_efficient=True, 
+                         cache_path=None, cache_id=None):
     """
-    Create K-means based graph with caching capability
+    Create graph based on Voronoi diagram with caching capability
     """
     # If cache path and ID are provided, try to load from cache
     if cache_path and cache_id:
-        cache_file = f"{cache_path}/kmeans_graph_cache_{cache_id}.pkl"
+        cache_file = f"{cache_path}/voronoi_graph_cache_{cache_id}.pkl"
         if os.path.exists(cache_file):
             print(f"Loading cached graph from {cache_file}...")
             with open(cache_file, "rb") as f:
@@ -51,97 +51,48 @@ def create_kmeans_graph(cell_features, cell_coords, n_clusters=None, k_neighbors
                 data = cached_data["data"]
                 return G, data
     
-    print(f"Creating K-means graph for {len(cell_coords)} cells...")
-    
-    # Determine number of clusters if not specified
-    if n_clusters is None:
-        # A rule of thumb: sqrt of number of samples
-        n_clusters = min(int(np.sqrt(len(cell_coords))), 100)
-    
-    print(f"Clustering into {n_clusters} clusters...")
-    
-    # Perform K-means clustering
-    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-    cluster_labels = kmeans.fit_predict(cell_coords)
+    print(f"Creating Voronoi graph for {len(cell_coords)} cells...")
     
     # Create a graph
     G = nx.Graph()
     
     # Add nodes to the graph
     for i in tqdm(range(len(cell_coords)), desc="Adding nodes"):
-        G.add_node(i, pos=cell_coords[i], cluster=cluster_labels[i])
+        G.add_node(i, pos=cell_coords[i])
     
-    # Connect nodes within the same cluster based on nearest neighbors
-    print("Connecting nodes within clusters...")
+    # Compute Voronoi diagram
+    # Add a small amount of jitter to coordinates to avoid issues with duplicate points
+    jittered_coords = cell_coords + np.random.normal(0, 1e-10, cell_coords.shape)
+    vor = Voronoi(jittered_coords)
     
-    # Process each cluster separately to save memory
-    for cluster_id in tqdm(range(n_clusters), desc="Processing clusters"):
-        # Get indices of cells in this cluster
-        cluster_indices = np.where(cluster_labels == cluster_id)[0]
+    # Create edges between adjacent Voronoi cells
+    print("Creating edges between adjacent Voronoi cells...")
+    ridge_points = vor.ridge_points
+    for i in tqdm(range(len(ridge_points)), desc="Adding edges"):
+        p1, p2 = ridge_points[i]
+        # Only add edge if the distance is below max_distance
+        if max_distance is None or np.linalg.norm(cell_coords[p1] - cell_coords[p2]) <= max_distance:
+            G.add_edge(p1, p2)
+    
+    # For points at the boundary of the Voronoi diagram (with no neighbors or very few),
+    # we need to ensure they have connections. Use KNN for these points.
+    degree_dict = dict(G.degree())
+    isolated_nodes = [node for node, degree in degree_dict.items() if degree < 2]
+    
+    if isolated_nodes:
+        print(f"Adding connections for {len(isolated_nodes)} isolated or boundary nodes...")
+        isolated_coords = cell_coords[isolated_nodes]
         
-        if len(cluster_indices) > 1:  # Need at least 2 points for nearest neighbors
-            # Get coordinates of cells in this cluster
-            cluster_coords = cell_coords[cluster_indices]
-            
-            # Find k nearest neighbors for each cell in the cluster
-            k = min(k_neighbors, len(cluster_indices) - 1)  # Can't have more neighbors than points - 1
-            nn = NearestNeighbors(n_neighbors=k+1)  # +1 because the point itself is included
-            nn.fit(cluster_coords)
-            distances, indices = nn.kneighbors(cluster_coords)
-            
-            # Add edges based on nearest neighbors
-            for i in range(len(cluster_indices)):
-                source = cluster_indices[i]
-                
-                # Skip the first neighbor as it's the point itself
-                for j, idx in enumerate(indices[i][1:], 1):
-                    target = cluster_indices[idx]
-                    dist = distances[i][j]
-                    
-                    # Only add edge if within max_distance
-                    if max_distance is None or dist <= max_distance:
-                        G.add_edge(int(source), int(target))
-    
-    # Connect neighboring clusters
-    print("Connecting neighboring clusters...")
-    
-    # Find centroids of each cluster
-    centroids = kmeans.cluster_centers_
-    
-    # Find nearest neighboring clusters for each cluster
-    nn_clusters = NearestNeighbors(n_neighbors=3)  # Connect to 2 nearest clusters
-    nn_clusters.fit(centroids)
-    c_distances, c_indices = nn_clusters.kneighbors(centroids)
-    
-    # For each pair of neighboring clusters, connect their boundary points
-    for i in range(n_clusters):
-        cluster_i_indices = np.where(cluster_labels == i)[0]
+        # Use KNN to find nearest neighbors for isolated points
+        k = min(5, len(cell_coords) - 1)  # Find at least 5 neighbors if possible
+        nbrs = NearestNeighbors(n_neighbors=k+1).fit(cell_coords)  # +1 because the point itself is included
+        distances, indices = nbrs.kneighbors(isolated_coords)
         
-        # Skip the first neighbor as it's the cluster itself
-        for j in c_indices[i][1:]:
-            cluster_j_indices = np.where(cluster_labels == j)[0]
-            
-            # Find the closest pair of points between the two clusters
-            min_dist = float('inf')
-            closest_pair = None
-            
-            # Use a sampling approach to reduce computational load for large clusters
-            sample_size_i = min(len(cluster_i_indices), 100)
-            sample_size_j = min(len(cluster_j_indices), 100)
-            
-            sampled_i = np.random.choice(cluster_i_indices, sample_size_i, replace=False)
-            sampled_j = np.random.choice(cluster_j_indices, sample_size_j, replace=False)
-            
-            for idx_i in sampled_i:
-                for idx_j in sampled_j:
-                    dist = np.linalg.norm(cell_coords[idx_i] - cell_coords[idx_j])
-                    if dist < min_dist and dist <= max_distance:
-                        min_dist = dist
-                        closest_pair = (idx_i, idx_j)
-            
-            # Connect the closest pair if found and within max_distance
-            if closest_pair is not None:
-                G.add_edge(int(closest_pair[0]), int(closest_pair[1]))
+        for i, node_idx in enumerate(isolated_nodes):
+            for j in range(1, k+1):  # Skip the first neighbor (the point itself)
+                neighbor_idx = indices[i, j]
+                if max_distance is None or distances[i, j] <= max_distance:
+                    G.add_edge(node_idx, neighbor_idx)
     
     print(f"Graph construction complete: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
 
@@ -160,13 +111,14 @@ def create_kmeans_graph(cell_features, cell_coords, n_clusters=None, k_neighbors
     # Save to cache if cache path and ID are provided
     if cache_path and cache_id:
         os.makedirs(cache_path, exist_ok=True)
-        cache_file = f"{cache_path}/kmeans_graph_cache_{cache_id}.pkl"
+        cache_file = f"{cache_path}/voronoi_graph_cache_{cache_id}.pkl"
         print(f"Saving graph to cache: {cache_file}")
         with open(cache_file, "wb") as f:
             pickle.dump({"G": G, "data": data}, f)
     
     return G, data
 
+# The rest of your code remains unchanged
 class BiomarkerGNN(torch.nn.Module):
     def __init__(self, input_dim, hidden_dim=128, output_dim=1, num_layers=4, dropout=0.3, 
                  residual=True, edge_features=False):
@@ -486,36 +438,30 @@ def main():
     cache_dir = "/playpen/jesse/HE_IF/graph_comparison/graph_cache"
     os.makedirs(cache_dir, exist_ok=True)
     
-    # Use the K-means graph construction with caching
-    G_train, train_data = create_kmeans_graph(
+    # Use the Voronoi graph construction with caching
+    G_train, train_data = create_voronoi_graph(
         train_features, 
         train_coords, 
-        n_clusters=int(np.sqrt(len(train_coords))),
-        k_neighbors=15,
         max_distance=50, 
         memory_efficient=True,
         cache_path=cache_dir,
-        cache_id="kmeans_train"
+        cache_id="voronoi_train"
     )
-    G_val, val_data = create_kmeans_graph(
+    G_val, val_data = create_voronoi_graph(
         val_features, 
         val_coords, 
-        n_clusters=int(np.sqrt(len(val_coords))),
-        k_neighbors=15,
         max_distance=50, 
         memory_efficient=True,
         cache_path=cache_dir,
-        cache_id="kmeans_val"
+        cache_id="voronoi_val"
     )
-    G_test, test_data = create_kmeans_graph(
+    G_test, test_data = create_voronoi_graph(
         test_features, 
         test_coords, 
-        n_clusters=int(np.sqrt(len(test_coords))),
-        k_neighbors=15,
         max_distance=50, 
         memory_efficient=True,
         cache_path=cache_dir,
-        cache_id="kmeans_test"
+        cache_id="voronoi_test"
     )
 
     input_dim = features.shape[1]
@@ -540,7 +486,7 @@ def main():
     
     print("Starting training...")
 
-    output_dir = "hybrid_kmeans_gnn_results"
+    output_dir = "voronoi_gnn_results"
     epochs = 50
     patience = 15
     lr = 0.001
@@ -573,39 +519,50 @@ def main():
 if __name__ == "__main__":
     main()
 
-# CUDA_VISIBLE_DEVICES=4 nohup python k_means_vit.py > ./log/k_means_vit.log 2>&1 &
+# CUDA_VISIBLE_DEVICES=5 nohup python voronoi_vit.py > voronoi_vit.log 2>&1 &
+# CUDA_VISIBLE_DEVICES=5 python voronoi_vit.py
+
 
 """
-A488: Pearson=0.0020, Spearman=0.0034, C-index=0.5012
-CD3: Pearson=-0.0012, Spearman=0.0065, C-index=0.5022
-Ki67: Pearson=-0.0006, Spearman=0.0022, C-index=0.5007
-CD4: Pearson=0.0020, Spearman=0.0114, C-index=0.5038
-CD20: Pearson=0.0033, Spearman=0.0097, C-index=0.5032
-CD163: Pearson=0.0073, Spearman=0.0043, C-index=0.5014
-Ecadherin: Pearson=-0.0009, Spearman=0.0058, C-index=0.5019
-LaminABC: Pearson=0.0007, Spearman=0.0036, C-index=0.5012
-PCNA: Pearson=0.0026, Spearman=0.0066, C-index=0.5022
-A555: Pearson=0.0034, Spearman=0.0043, C-index=0.5015
-NaKATPase: Pearson=-0.0025, Spearman=0.0018, C-index=0.5006
-Keratin: Pearson=-0.0016, Spearman=0.0036, C-index=0.5012
-CD45: Pearson=0.0013, Spearman=-0.0041, C-index=0.4986
-CD68: Pearson=0.0012, Spearman=0.0059, C-index=0.5020
-FOXP3: Pearson=0.0031, Spearman=0.0007, C-index=0.5002
-Vimentin: Pearson=0.0029, Spearman=-0.0023, C-index=0.4992
-Desmin: Pearson=0.0096, Spearman=0.0054, C-index=0.5018
-Ki67_570: Pearson=0.0022, Spearman=0.0058, C-index=0.5020
-A647: Pearson=0.0031, Spearman=0.0041, C-index=0.5014
-CD45RO: Pearson=-0.0037, Spearman=0.0057, C-index=0.5019
-aSMA: Pearson=0.0065, Spearman=0.0046, C-index=0.5015
-PD1: Pearson=0.0058, Spearman=0.0107, C-index=0.5036
-CD8a: Pearson=0.0041, Spearman=0.0029, C-index=0.5010
-PDL1: Pearson=-0.0007, Spearman=0.0017, C-index=0.5006
-CDX2: Pearson=0.0033, Spearman=0.0099, C-index=0.5033
-CD31: Pearson=0.0111, Spearman=0.0053, C-index=0.5018
-Collagen: Pearson=0.0039, Spearman=0.0016, C-index=0.5005
+Hoechst1: Pearson=0.0006, Spearman=-0.0035, C-index=0.4988
+Hoechst2: Pearson=0.0004, Spearman=-0.0013, C-index=0.4997
+Hoechst3: Pearson=-0.0013, Spearman=-0.0037, C-index=0.4988
+Hoechst4: Pearson=-0.0021, Spearman=-0.0019, C-index=0.4994
+Hoechst5: Pearson=-0.0036, Spearman=-0.0026, C-index=0.4998
+Hoechst6: Pearson=-0.0029, Spearman=-0.0017, C-index=0.4994
+Hoechst7: Pearson=-0.0026, Spearman=-0.0002, C-index=0.4999
+Hoechst8: Pearson=-0.0009, Spearman=-0.0010, C-index=0.4997
+Hoechst9: Pearson=0.0010, Spearman=-0.0016, C-index=0.4995
+A488: Pearson=-0.0029, Spearman=-0.0022, C-index=0.4993
+CD3: Pearson=0.0004, Spearman=0.0016, C-index=0.5005
+Ki67: Pearson=-0.0008, Spearman=-0.0027, C-index=0.4991
+CD4: Pearson=0.0017, Spearman=0.0032, C-index=0.5011
+CD20: Pearson=-0.0010, Spearman=0.0022, C-index=0.5007
+CD163: Pearson=-0.0015, Spearman=0.0013, C-index=0.5004
+Ecadherin: Pearson=-0.0038, Spearman=0.0033, C-index=0.5011
+LaminABC: Pearson=0.0007, Spearman=0.0065, C-index=0.5022
+PCNA: Pearson=0.0022, Spearman=0.0008, C-index=0.5003
+A555: Pearson=-0.0013, Spearman=-0.0041, C-index=0.4986
+NaKATPase: Pearson=-0.0032, Spearman=0.0029, C-index=0.5010
+Keratin: Pearson=-0.0013, Spearman=0.0025, C-index=0.5008
+CD45: Pearson=0.0034, Spearman=0.0011, C-index=0.5004
+CD68: Pearson=-0.0057, Spearman=0.0017, C-index=0.5005
+FOXP3: Pearson=-0.0006, Spearman=-0.0011, C-index=0.4997
+Vimentin: Pearson=0.0010, Spearman=-0.0004, C-index=0.4999
+Desmin: Pearson=0.0014, Spearman=0.0100, C-index=0.5033
+Ki67_570: Pearson=0.0045, Spearman=-0.0029, C-index=0.4990
+A647: Pearson=-0.0039, Spearman=0.0036, C-index=0.5012
+CD45RO: Pearson=0.0012, Spearman=0.0045, C-index=0.5015
+aSMA: Pearson=0.0020, Spearman=0.0057, C-index=0.5019
+PD1: Pearson=-0.0053, Spearman=0.0134, C-index=0.5045
+CD8a: Pearson=-0.0041, Spearman=0.0019, C-index=0.5006
+PDL1: Pearson=-0.0078, Spearman=0.0059, C-index=0.5020
+CDX2: Pearson=-0.0053, Spearman=0.0031, C-index=0.5010
+CD31: Pearson=-0.0006, Spearman=0.0060, C-index=0.5020
+Collagen: Pearson=0.0012, Spearman=0.0054, C-index=0.5018
 
 AVERAGE METRICS:
-Average Pearson R: 0.0036
-Average Spearman R: 0.0048
-Average C-index: 0.5015
+Average Pearson R: -0.0011
+Average Spearman R: 0.0015
+Average C-index: 0.5005
 """
