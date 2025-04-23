@@ -179,3 +179,8 @@ cython_debug/
 /graph_comparison/cell_feature/cell_features.npz
 /graph_comparison/cell_feature/data_splits.json
 /baseline/temp_cell_coords.csv
+/graph_comparison/cell_feature_all/*
+/graph_comparison/biomarker_prediction/*
+/graph_comparison/graph_cache/*
+/graph_comparison/wandb/*
+/graph_comparison/results/*

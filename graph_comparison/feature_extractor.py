@@ -37,7 +37,7 @@ def process_batch(batch_df, he_image, gpu_id, output_file):
     
     for _, row in tqdm(batch_df.iterrows(), total=len(batch_df)):
         cell_id = row.name
-        x, y, area = int(row['X']), int(row['Y']), int(row['AREA'])
+        x, y, area = int(row['hne_X']), int(row['hne_Y']), int(row['AREA'])
         
         patch = extract_patch(he_image, x, y, area)
         pil_image = transforms.ToPILImage()(patch)
@@ -130,4 +130,4 @@ if __name__ == "__main__":
     main()
 
 
-# CUDA_VISIBLE_DEVICES=4,5,7 python feature_extractor.py
+# nohup python feature_extractor.py > fe.log 2>&1 &

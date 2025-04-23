@@ -21,6 +21,8 @@ from tqdm import tqdm
 import wandb
 import matplotlib.pyplot as plt
 import cv2
+from transformers import ViTModel, ViTImageProcessor
+
 
 
 class HEBiomarkerDataset(Dataset):
@@ -65,12 +67,24 @@ class HEBiomarkerDataset(Dataset):
         return len(self.df)
     
     def __getitem__(self, idx):
-        t_getitem_start = time.time()
-        
         row = self.df.iloc[idx]
-        x, y, area = int(row["X_centroid"]), int(row["Y_centroid"]), int(row["Area"])
-        radius = int(np.sqrt(area / np.pi))
+        
+        x, y = int(row["hne_X"]), int(row["hne_Y"])
+        area = int(row["AREA"])
+        
+        if len(self.he_image.shape) == 3 and self.he_image.shape[0] == 3:
+            img_height, img_width = self.he_image.shape[1], self.he_image.shape[2]
+        else:
+            img_height, img_width = self.he_image.shape[0], self.he_image.shape[1]
+            
+        if x < 0 or x >= img_width:
+            x = min(max(0, x), img_width-1)
+        if y < 0 or y >= img_height:
+            y = min(max(0, y), img_height-1)
+        
+        radius = int(np.sqrt(max(area, 1) / np.pi))
         radius = max(radius, self.patch_size // 4)
+        radius = min(radius, min(x, img_width - x, y, img_height - y, 1000))
         
         patch = self._extract_patch(x, y, radius)
         patch_tensor = self._transform_patch(patch)
@@ -79,17 +93,45 @@ class HEBiomarkerDataset(Dataset):
         
         return patch_tensor, morphology_tensor, target_tensor
     
+    # def _extract_patch(self, x, y, radius):
+    #     x_min, x_max = max(0, x - radius), min(self.he_image.shape[1], x + radius)
+    #     y_min, y_max = max(0, y - radius), min(self.he_image.shape[0], y + radius)
+        
+    #     if x_max <= x_min or y_max <= y_min or x_min >= self.he_image.shape[1] or y_min >= self.he_image.shape[0]:
+    #         return np.zeros((self.patch_size, self.patch_size, 3), dtype=np.float32)
+        
+    #     patch = self.he_image[y_min:y_max, x_min:x_max]
+        
+    #     if patch.shape[0] < 3 or patch.shape[1] < 3:
+    #         return np.zeros((self.patch_size, self.patch_size, 3), dtype=np.float32)
+        
+    #     resized_patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_CUBIC)
+    #     return resized_patch
+
     def _extract_patch(self, x, y, radius):
-        x_min, x_max = max(0, x - radius), min(self.he_image.shape[1], x + radius)
-        y_min, y_max = max(0, y - radius), min(self.he_image.shape[0], y + radius)
+        x, y = int(x), int(y)
+        radius = int(radius)
         
-        if x_max <= x_min or y_max <= y_min or x_min >= self.he_image.shape[1] or y_min >= self.he_image.shape[0]:
+        if len(self.he_image.shape) == 3 and self.he_image.shape[0] == 3:
+            if not hasattr(self, 'transposed_image'):
+                self.transposed_image = np.transpose(self.he_image, (1, 2, 0))
+            he_image = self.transposed_image
+        else:
+            he_image = self.he_image
+        
+        x_min, x_max = max(0, x - radius), min(he_image.shape[1], x + radius)
+        y_min, y_max = max(0, y - radius), min(he_image.shape[0], y + radius)
+        
+        if x_max <= x_min or y_max <= y_min or x_min >= he_image.shape[1] or y_min >= he_image.shape[0]:
             return np.zeros((self.patch_size, self.patch_size, 3), dtype=np.float32)
         
-        patch = self.he_image[y_min:y_max, x_min:x_max]
+        patch = he_image[y_min:y_max, x_min:x_max]
         
-        if patch.shape[0] < 3 or patch.shape[1] < 3:
+        if patch.size == 0 or patch.shape[0] < 3 or patch.shape[1] < 3:
             return np.zeros((self.patch_size, self.patch_size, 3), dtype=np.float32)
+        
+        if len(patch.shape) == 2:
+            patch = cv2.cvtColor(patch, cv2.COLOR_GRAY2BGR)
         
         resized_patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_CUBIC)
         return resized_patch
@@ -121,8 +163,7 @@ class HEBiomarkerModel(nn.Module):
         t_init_start = time.time()
         
         t_backbone_start = time.time()
-        self.backbone = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
-        self.backbone.heads = nn.Identity()
+        self.backbone = ViTModel.from_pretrained("google/vit-base-patch16-224")
         t_backbone_end = time.time()
         print(f"[TIME] ViT backbone initialization: {t_backbone_end - t_backbone_start:.4f}s")
         
@@ -137,7 +178,6 @@ class HEBiomarkerModel(nn.Module):
         print(f"[TIME] Morphology encoder initialization: {t_morph_end - t_morph_start:.4f}s")
         
         t_fusion_start = time.time()
-
         self.fusion = nn.Sequential(
             nn.Linear(768 + hidden_dim, hidden_dim),
             nn.LayerNorm(hidden_dim), 
@@ -158,12 +198,15 @@ class HEBiomarkerModel(nn.Module):
         
         t_init_end = time.time()
         print(f"[TIME] Total model initialization: {t_init_end - t_init_start:.4f}s")
+        
+        self.processor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
     
     def forward(self, images, morphology):
         t_forward_start = time.time()
         
         t_backbone_forward_start = time.time()
-        img_features = self.backbone(images)
+        outputs = self.backbone(images)
+        img_features = outputs.pooler_output
         t_backbone_forward_end = time.time()
         
         t_morph_forward_start = time.time()
@@ -188,41 +231,25 @@ class HEBiomarkerModel(nn.Module):
         return output
 
 
-def find_data_files(data_directory):
-    t_start = time.time()
-    
-    folders = [os.path.join(data_directory, d) for d in os.listdir(data_directory) 
-               if os.path.isdir(os.path.join(data_directory, d))]
-
-    if not folders:
-        raise ValueError("No valid folders found in the data directory")
-    
-    print(f"Found {len(folders)} folders")
-    
+def find_data_files(data_dir):
     all_data_files = []
-    for folder in folders:
-        file_index = os.path.basename(folder)
+    file_names = os.listdir(data_dir)
+
+    file_indices = set(f.split('_')[0].split('-')[0] for f in file_names)
+    for file_index in sorted(file_indices):
         csv_file = None
         he_path = None
         
-        for file in os.listdir(folder):
-            file_path = os.path.join(folder, file)
-            if file.endswith('.csv') and file_index in file:
-                csv_file = file_path
-            elif 'registered.ome.tif' in file:
-                he_path = file_path
+        for file in file_names:
+            if file_index in file:
+                if "new_coordinates.csv" in file:
+                    csv_file = os.path.join(data_dir, file)
+                elif "HE.ome.tif" in file:
+                    he_path = os.path.join(data_dir, file)
         
-        if csv_file is not None and he_path is not None:
+        if csv_file and he_path:
             all_data_files.append((csv_file, he_path, file_index))
-    
-    if not all_data_files:
-        raise ValueError(f"No valid data files found in any folder")
-    
-    print(f"Found {len(all_data_files)} valid data file pairs across all folders")
-    
-    t_end = time.time()
-    print(f"[TIME] File search: {t_end - t_start:.4f}s")
-    
+    print("Length:", len(all_data_files))
     return all_data_files
 
 
@@ -318,10 +345,6 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, de
         t_to_device_end = time.time()
         to_device_times.append(t_to_device_end - t_to_device_start)
         
-        # Skip this batch if it's a singleton (should not happen with drop_last=True)
-        if images.size(0) < 2:
-            print(f"WARNING: Skipping batch {i} with only {images.size(0)} samples")
-            continue
         
         optimizer.zero_grad(set_to_none=True)
         
@@ -414,6 +437,17 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, scaler, de
         all_losses = []
         print("WARNING: No batches were processed in this epoch!")
     
+    checkpoint_path = os.path.join(batch_checkpoints_dir, f"model_epoch{epoch+1}.pt")
+    model_state_dict = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+    torch.save({
+        'epoch': epoch,
+        'batch': i,
+        'model_state_dict': model_state_dict,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'loss': batch_loss,
+        'batch_losses': all_losses
+    }, checkpoint_path)
+    
     return train_loss, all_losses, t_end - t_start
 
 
@@ -441,11 +475,7 @@ def validate(model, val_loader, criterion, device, epoch, num_epochs):
             targets = targets.to(device, non_blocking=True)
             t_val_to_device_end = time.time()
             val_to_device_times.append(t_val_to_device_end - t_val_to_device_start)
-            
-            # Skip singleton batches during validation too
-            if images.size(0) < 2:
-                print(f"WARNING: Skipping validation batch {i} with only {images.size(0)} samples")
-                continue
+
             
             t_val_forward_start = time.time()
             with torch.amp.autocast('cuda'):
@@ -474,7 +504,7 @@ def validate(model, val_loader, criterion, device, epoch, num_epochs):
                       f"Forward: {val_forward_times[-1]:.4f}s, "
                       f"Loss: {batch_loss:.6f}")
     
-    # Check if we processed any batches
+
     if len(val_loader.dataset) > 0 and len(all_val_losses) > 0:
         val_loss /= len(val_loader.dataset)
         t_end = time.time()
@@ -533,11 +563,6 @@ def evaluate(model, test_loader, criterion, device):
             t_test_to_device_end = time.time()
             test_to_device_times.append(t_test_to_device_end - t_test_to_device_start)
             
-            # Skip singleton batches during testing too
-            if images.size(0) < 2:
-                print(f"WARNING: Skipping test batch {i} with only {images.size(0)} samples")
-                continue
-            
             t_test_forward_start = time.time()
             with torch.amp.autocast('cuda'):
                 outputs = model(images, morphology)
@@ -573,7 +598,6 @@ def evaluate(model, test_loader, criterion, device):
           f"Avg to device time: {np.mean(test_to_device_times):.4f}s, "
           f"Avg forward time: {np.mean(test_forward_times):.4f}s")
     
-    # Check if we have any outputs to process
     if all_targets and all_outputs:
         t_numpy_conversion_start = time.time()
         all_targets = np.vstack(all_targets)
@@ -641,19 +665,17 @@ def calculate_metrics(all_targets, all_outputs, biomarkers):
 
 def save_results(results_df, all_outputs, test_df, biomarkers, batch_size, output_dir):
     t_start = time.time()
-    
-    # Check if we have valid results to save
+
     if results_df.empty:
         print("WARNING: No results to save")
         return
     
     t_save_metrics_start = time.time()
-    results_df.to_csv(os.path.join(output_dir, "biomarker_metrics_cnn.csv"))
+    results_df.to_csv(os.path.join(output_dir, "biomarker_metrics_vit.csv"))
     t_save_metrics_end = time.time()
     print(f"[TIME] Metrics saving: {t_save_metrics_end - t_save_metrics_start:.4f}s")
     
     t_predictions_start = time.time()
-    # Ensure test_df has enough rows
     if len(test_df) == 0:
         print("WARNING: Empty test dataframe, cannot save predictions")
         return
@@ -680,7 +702,7 @@ def save_results(results_df, all_outputs, test_df, biomarkers, batch_size, outpu
             test_df[f"{biomarker}_predicted"] = 0.0
     
     t_save_predictions_start = time.time()
-    test_df.to_csv(os.path.join(output_dir, f"cell_predictions_cnn.csv"), index=False)
+    test_df.to_csv(os.path.join(output_dir, f"cell_predictions_vit.csv"), index=False)
     t_save_predictions_end = time.time()
     print(f"[TIME] Predictions saving: {t_save_predictions_end - t_save_predictions_start:.4f}s")
     
@@ -704,7 +726,7 @@ def save_model(model, biomarkers, morphology_features, hidden_dim, output_dim, o
         'morphology_features': morphology_features,
         'hidden_dim': hidden_dim,
         'output_dim': output_dim
-    }, os.path.join(output_dir, "biomarker_model_cnn.pt"))
+    }, os.path.join(output_dir, "biomarker_model_vit.pt"))
     
     t_end = time.time()
     print(f"[TIME] Model saving: {t_end - t_start:.4f}s")
@@ -723,7 +745,7 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
     
     output_directory = "./results"
     os.makedirs(output_directory, exist_ok=True)
-    output_dir = os.path.join(output_directory, "model_results_cnn")
+    output_dir = os.path.join(output_directory, "model_results_vit")
     os.makedirs(output_dir, exist_ok=True)
     
     batch_checkpoints_dir = os.path.join(output_dir, "batch_checkpoints")
@@ -769,12 +791,23 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
     
     best_val_loss = float('inf')
     
-    print(f"Training CNN model for {num_epochs} epochs...")
+    print(f"Training ViT model for {num_epochs} epochs...")
     for epoch in range(num_epochs):
         t_epoch_start = time.time()
         
         train_loss, train_losses, train_time = train_epoch(model, train_loader, criterion, optimizer, scheduler, 
                                                         scaler, device, epoch, num_epochs, batch_checkpoints_dir)
+
+        # checkpoint = torch.load('/playpen/jesse/HE_IF/baseline/results/model_results_vit/batch_checkpoints/model_epoch1.pt')
+        # state_dict = checkpoint['model_state_dict']
+
+        # if isinstance(model, torch.nn.DataParallel):
+        #     new_state_dict = {'module.' + k if not k.startswith('module.') else k: v for k, v in state_dict.items()}
+        # else:
+        #     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+        
+        # model.load_state_dict(new_state_dict)
+
         val_loss, val_losses, val_time = validate(model, val_loader, criterion, device, epoch, num_epochs)
         
         t_epoch_end = time.time()
@@ -825,7 +858,7 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
                 'val_loss': val_loss,
                 'biomarkers': biomarkers,
                 'morphology_features': morphology_features
-            }, os.path.join(output_dir, "best_biomarker_cnn.pt"))
+            }, os.path.join(output_dir, "best_biomarker_vit.pt"))
             t_save_end = time.time()
             print(f"[TIME] Checkpoint saving: {t_save_end - t_save_start:.4f}s")
             
@@ -838,7 +871,7 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
     # Test with the best model
     print("Loading best model for testing...")
     try:
-        checkpoint = torch.load(os.path.join(output_dir, "best_biomarker_cnn.pt"))
+        checkpoint = torch.load(os.path.join(output_dir, "best_biomarker_vit.pt"))
         if isinstance(model, nn.DataParallel):
             model.module.load_state_dict(checkpoint['model_state_dict'])
         else:
@@ -892,18 +925,21 @@ if __name__ == "__main__":
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
     
-    data_directory = "../data/data"
+    data_directory = "/playpen/jesse/HIPI/preprocess/data"
     biomarkers = [
-        "Hoechst", "AF1", "CD31", "CD45", "CD68", "Argo550", "CD4", "FOXP3", "CD8a",
-        "CD45RO", "CD20", "PD-L1", "CD3e", "CD163", "E-cadherin", "PD-1", "Ki67", "Pan-CK", "SMA"
+        "Hoechst1", "Hoechst2", "Hoechst3", "Hoechst4", "Hoechst5", "Hoechst6",
+        "Hoechst7", "Hoechst8", "Hoechst9", "A488", "CD3", "Ki67", "CD4",
+        "CD20", "CD163", "Ecadherin", "LaminABC", "PCNA", "A555", "NaKATPase",
+        "Keratin", "CD45", "CD68", "FOXP3", "Vimentin", "Desmin", "Ki67_570",
+        "A647", "CD45RO", "aSMA", "PD1", "CD8a", "PDL1", "CDX2", "CD31",
+        "Collagen"
     ]
     
     morphology_features = [
-        "Area", "MajorAxisLength", "MinorAxisLength", "Eccentricity", 
-        "Solidity", "Extent", "Perimeter", "X_centroid", "Y_centroid"
+        "AREA", "CIRC", "hne_X", "hne_Y"
     ]
     
-    batch_size = 1024 
+    batch_size = 128 
     
     if hasattr(torch.cuda, 'set_per_process_memory_fraction'):
         torch.cuda.set_per_process_memory_fraction(0.9)
@@ -911,6 +947,6 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     
-    train_pipeline(data_directory, biomarkers, morphology_features, batch_size=batch_size, num_epochs=1)
+    train_pipeline(data_directory, biomarkers, morphology_features, batch_size=batch_size, num_epochs=2)
 
-# CUDA_VISIBLE_DEVICES=3,4,5,6,7 nohup python vit.py > vit.log 2>&1 &
+# CUDA_VISIBLE_DEVICES=6 nohup python vit.py > vit.log 2>&1 &
