@@ -39,13 +39,9 @@ class HEBiomarkerDataset(Dataset):
         for feature in morphology_features:
             if feature in df.columns:
                 available_features.append(feature)
-        
-        if not available_features:
-            print("Warning: No morphology features found in dataset! Using only Area and centroid coordinates.")
-            self.morphology_features = ["Area", "X_centroid", "Y_centroid"]
-        else:
-            print(f"Using {len(available_features)} morphology features: {available_features}")
-            self.morphology_features = available_features
+
+        print(f"Using {len(available_features)} morphology features: {available_features}")
+        self.morphology_features = available_features
         t_feature_check_end = time.time()
         print(f"[TIME] Feature checking: {t_feature_check_end - t_feature_check_start:.4f}s")
             
@@ -93,20 +89,6 @@ class HEBiomarkerDataset(Dataset):
         
         return patch_tensor, morphology_tensor, target_tensor
     
-    # def _extract_patch(self, x, y, radius):
-    #     x_min, x_max = max(0, x - radius), min(self.he_image.shape[1], x + radius)
-    #     y_min, y_max = max(0, y - radius), min(self.he_image.shape[0], y + radius)
-        
-    #     if x_max <= x_min or y_max <= y_min or x_min >= self.he_image.shape[1] or y_min >= self.he_image.shape[0]:
-    #         return np.zeros((self.patch_size, self.patch_size, 3), dtype=np.float32)
-        
-    #     patch = self.he_image[y_min:y_max, x_min:x_max]
-        
-    #     if patch.shape[0] < 3 or patch.shape[1] < 3:
-    #         return np.zeros((self.patch_size, self.patch_size, 3), dtype=np.float32)
-        
-    #     resized_patch = cv2.resize(patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_CUBIC)
-    #     return resized_patch
 
     def _extract_patch(self, x, y, radius):
         x, y = int(x), int(y)
@@ -751,10 +733,6 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
     batch_checkpoints_dir = os.path.join(output_dir, "batch_checkpoints")
     os.makedirs(batch_checkpoints_dir, exist_ok=True)
     
-    if morphology_features is None:
-        morphology_features = ["Area", "MajorAxisLength", "MinorAxisLength", "Eccentricity", 
-                               "Solidity", "Extent", "Perimeter", "X_centroid", "Y_centroid"]
-    
     all_data_files = find_data_files(data_directory)
     
     train_files, val_files, test_files = create_data_splits(all_data_files)
@@ -936,7 +914,7 @@ if __name__ == "__main__":
     ]
     
     morphology_features = [
-        "AREA", "CIRC", "hne_X", "hne_Y"
+        "AREA", "hne_X", "hne_Y"
     ]
     
     batch_size = 128 
