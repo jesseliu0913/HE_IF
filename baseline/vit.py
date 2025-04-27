@@ -727,7 +727,7 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
     
     output_directory = "./results"
     os.makedirs(output_directory, exist_ok=True)
-    output_dir = os.path.join(output_directory, "model_results_vit")
+    output_dir = os.path.join(output_directory, "model_results_vit_3feature")
     os.makedirs(output_dir, exist_ok=True)
     
     batch_checkpoints_dir = os.path.join(output_dir, "batch_checkpoints")
