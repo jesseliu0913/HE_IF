@@ -776,16 +776,6 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
         train_loss, train_losses, train_time = train_epoch(model, train_loader, criterion, optimizer, scheduler, 
                                                         scaler, device, epoch, num_epochs, batch_checkpoints_dir)
 
-        # checkpoint = torch.load('/playpen/jesse/HE_IF/baseline/results/model_results_vit/batch_checkpoints/model_epoch1.pt')
-        # state_dict = checkpoint['model_state_dict']
-
-        # if isinstance(model, torch.nn.DataParallel):
-        #     new_state_dict = {'module.' + k if not k.startswith('module.') else k: v for k, v in state_dict.items()}
-        # else:
-        #     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-        
-        # model.load_state_dict(new_state_dict)
-
         val_loss, val_losses, val_time = validate(model, val_loader, criterion, device, epoch, num_epochs)
         
         t_epoch_end = time.time()
@@ -840,13 +830,11 @@ def train_pipeline(data_directory, biomarkers, morphology_features=None, batch_s
             t_save_end = time.time()
             print(f"[TIME] Checkpoint saving: {t_save_end - t_save_start:.4f}s")
             
-            # Log best model to wandb
             wandb.run.summary["best_val_loss"] = best_val_loss
             wandb.run.summary["best_epoch"] = epoch
     
     torch.cuda.empty_cache()
     
-    # Test with the best model
     print("Loading best model for testing...")
     try:
         checkpoint = torch.load(os.path.join(output_dir, "best_biomarker_vit.pt"))
